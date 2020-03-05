@@ -153,6 +153,7 @@ func extractFlags(volumeContext map[string]string) (string, string, string, map[
 
 	delete(flags, "remote")
 	delete(flags, "remotePath")
+	delete(flags, "secretName")
 
 	return remote, remotePath, configData, flags, nil
 }
