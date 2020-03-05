@@ -74,10 +74,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		mountOptions = append(mountOptions, "ro")
 	}
 
-	// Load default connection settings from secret
-	secret, e := getSecret("rclone-secret")
-
-	remote, remotePath, configData, flags, e := extractFlags(req.GetVolumeContext(), secret)
+	remote, remotePath, configData, flags, e := extractFlags(req.GetVolumeContext())
 	if e != nil {
 		klog.Warningf("storage parameter error: %s", e)
 		return nil, e
@@ -97,14 +94,30 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, string, string, map[string]string, error) {
+// extractFlags extracts the flags from the given volumeContext
+// Retturns: remote, remotePath, configData, flags, error
+func extractFlags(volumeContext map[string]string) (string, string, string, map[string]string, error) {
+	// Load default connection settings from secret
+	var secret *v1.Secret
+
+	if volumeContext["secretName"] != "" {
+		// Load the secret that the PV spec defines
+		var e error
+		secret, e = getSecret(volumeContext["secretName"])
+		if e != nil {
+			// if the user explicitly requested a secret and there is an error fetching it, bail with an error
+			return "", "", "", nil, e
+		}
+	} else {
+		// use rclone-secret as the default secret if none was defined
+		secret, _ = getSecret("rclone-secret")
+	}
 
 	// Empty argument list
 	flags := make(map[string]string)
 
 	// Secret values are default, gets merged and overriden by corresponding PV values
 	if secret != nil && secret.Data != nil && len(secret.Data) > 0 {
-
 		// Needs byte to string casting for map values
 		for k, v := range secret.Data {
 			flags[k] = string(v)
@@ -242,7 +255,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 
 	remoteWithPath := fmt.Sprintf(":%s:%s", remote, remotePath)
 
-	if strings.Contains(configData, "[" + remote + "]") {
+	if strings.Contains(configData, "["+remote+"]") {
 		remoteWithPath = fmt.Sprintf("%s:%s", remote, remotePath)
 		klog.Infof("remote %s found in configData, remoteWithPath set to %s", remote, remoteWithPath)
 	}
