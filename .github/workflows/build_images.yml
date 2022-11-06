@@ -17,7 +17,7 @@ jobs:
       - name: Prepare
         id: prep
         run: |
-          DOCKER_IMAGE=${{ secrets.DOCKER_ORG }}/${GITHUB_REPOSITORY#*/}
+          DOCKER_IMAGE=dvcrn/${GITHUB_REPOSITORY#*/}
           VERSION=$(cat VERSION)
 
           TAGS="${DOCKER_IMAGE}:${VERSION},${DOCKER_IMAGE}:latest"
