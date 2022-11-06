@@ -55,12 +55,12 @@ jobs:
           push: true
           tags: ${{ env.tags }}
 
-      - name: Build DM
-        uses: docker/build-push-action@v2
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          file: ./Dockerfile.dm
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.tags }}
+      # - name: Build DM
+      #   uses: docker/build-push-action@v2
+      #   with:
+      #     builder: ${{ steps.buildx.outputs.name }}
+      #     context: .
+      #     file: ./Dockerfile.dm
+      #     platforms: linux/amd64,linux/arm64
+      #     push: true
+      #     tags: ${{ env.tags }}
