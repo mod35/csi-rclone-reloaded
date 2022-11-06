@@ -35,7 +35,7 @@ spec:
           image: quay.io/k8scsi/csi-cluster-driver-registrar:v1.0.1
           args:
             - "--v=5"
-            - "--pod-info-mount-version=\"v1\""
+            - '--pod-info-mount-version="v1"'
             - "--csi-address=$(ADDRESS)"
           env:
             - name: ADDRESS
@@ -44,8 +44,8 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: rclone
-          image: wunderio/csi-rclone:v1.3.1
-          args :
+          image: dvcrn/csi-rclone:v1.4.0
+          args:
             - "/bin/csi-rclone-plugin"
             - "--nodeid=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
