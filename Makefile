@@ -13,7 +13,7 @@
 # limitations under the License.
 
 VERSION=$(shell cat VERSION)
-REGISTRY_NAME=wunderio
+REGISTRY_NAME=dvcrn
 IMAGE_NAME=csi-rclone
 IMAGE_TAG=$(REGISTRY_NAME)/$(IMAGE_NAME):$(VERSION)
 
@@ -41,6 +41,13 @@ push:
 
 push-dm:
 	docker push $(IMAGE_TAG)-dm
+
+buildx:
+	docker buildx build --platform linux/amd64,linux/arm64 --push -t $(IMAGE_TAG) -f ./cmd/csi-rclone-plugin/Dockerfile .
+
+buildx-dm:
+	docker buildx build --platform linux/amd64,linux/arm64 --push -t $(IMAGE_TAG)-dm -f ./cmd/csi-rclone-plugin/Dockerfile.dm .
+
 
 clean:
 	go clean -r -x
