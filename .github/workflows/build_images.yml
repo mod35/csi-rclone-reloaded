@@ -26,8 +26,8 @@ jobs:
           echo ${VERSION}
           echo ${DOCKER_IMAGE}
 
-          echo "tags=${TAGS}" >> $GITHUB_STATE
-          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_STATE
+          echo "tags=${TAGS}" >> $GITHUB_ENV
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_ENV
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -48,6 +48,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@v2
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
