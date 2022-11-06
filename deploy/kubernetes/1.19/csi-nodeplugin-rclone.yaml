@@ -4,7 +4,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: csi-nodeplugin-rclone
-  namespace: csi-rclone
+  namespace: kube-system
 spec:
   selector:
     matchLabels:

@@ -5,7 +5,7 @@ kind: StatefulSet
 apiVersion: apps/v1
 metadata:
   name: csi-controller-rclone
-  namespace: csi-rclone
+  namespace: kube-system
 spec:
   serviceName: "csi-controller-rclone"
   replicas: 1
