@@ -33,7 +33,7 @@ spec:
             - name: socket-dir
               mountPath: /csi
         - name: rclone
-          image: dvcrn/csi-rclone:v1.4.0
+          image: dvcrn/csi-rclone-reloaded:v1.4.0
           args:
             - "/bin/csi-rclone-plugin"
             - "--nodeid=$(NODE_ID)"

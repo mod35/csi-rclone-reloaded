@@ -14,7 +14,7 @@
 
 VERSION=$(shell cat VERSION)
 REGISTRY_NAME=dvcrn
-IMAGE_NAME=csi-rclone
+IMAGE_NAME=csi-rclone-reloaded
 IMAGE_TAG=$(REGISTRY_NAME)/$(IMAGE_NAME):$(VERSION)
 
 .PHONY: all rclone-plugin clean rclone-container
