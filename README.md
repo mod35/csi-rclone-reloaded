@@ -102,17 +102,20 @@ spec:
 <pvc manifest here>
 ```
 
-### Example: Using a secret for defaults (thanks to [wunderio/csi-rclone#7](https://github.com/wunderio/csi-rclone/pull/7))
+### Example: Using a secret (thanks to [wunderio/csi-rclone#7](https://github.com/wunderio/csi-rclone/pull/7))
 
 _Note:_ secrets act as defaults, you can still override keys in your PV definitions.
 
-_Note 2_: Use `secret-rclone` as global default for when there are no secrets defined, for example if you always want the same S3 credentials across your pvs
+_Note 2_: Use `secret-rclone` as global default for when there are no secrets defined, for example if you always want the same S3 credentials across your PVs
+
+_Note 3_: Secrets need to be in the same namespace as the csi controller, so if you used the default of this repository, add it to `kube-system`
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
   name: my-secret
+  namespace: kube-system # <-- secret needs to be in kube-system namespace, same as CSI controller
 type: Opaque
 stringData:
   remote: "my-s3"
@@ -126,7 +129,7 @@ stringData:
     endpoint = http://minio-release.default:9000
 ```
 
-Then specify it into the PV (secret needs to be in the same namespace as pvc):
+Then specify it into the PV:
 
 ```yaml
 apiVersion: v1
@@ -147,6 +150,11 @@ spec:
     volumeAttributes:
       secretName: "my-secret"
 ```
+
+## Debugging & logs
+
+- After creating a pod, if something goes wrong you should be able to see it using `kubectl describe <pod>`
+- Check logs of the controller: `kubectl logs -f -l app=csi-nodeplugin-rclone --namespace kube-system -c rclone`
 
 ## Building plugin and creating image
 
