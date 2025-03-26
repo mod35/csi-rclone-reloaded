@@ -1,4 +1,7 @@
 # CHANGELOG
+1.5.0 (modes):
+- Forking to upgrade the underlying rclone version to fix this onedrive nightmare https://github.com/rclone/rclone/issues/7405
+
 
 1.4.0 (dvcrn):
 - Merge support for specifying config in secrets: https://github.com/wunderio/csi-rclone/pull/7
