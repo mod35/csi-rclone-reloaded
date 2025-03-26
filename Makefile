@@ -13,7 +13,7 @@
 # limitations under the License.
 
 VERSION=$(shell cat VERSION)
-REGISTRY_NAME=mod35
+REGISTRY_NAME=modes
 IMAGE_NAME=csi-rclone-reloaded
 IMAGE_TAG=$(REGISTRY_NAME)/$(IMAGE_NAME):$(VERSION)
 
