@@ -17,7 +17,7 @@ jobs:
       - name: Prepare
         id: prep
         run: |
-          DOCKER_IMAGE=dvcrn/${GITHUB_REPOSITORY#*/}
+          DOCKER_IMAGE=mod35/${GITHUB_REPOSITORY#*/}
           VERSION=$(cat VERSION)
 
           TAGS="${DOCKER_IMAGE}:${VERSION},${DOCKER_IMAGE}:latest"
@@ -42,7 +42,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
-          username: dvcrn
+          username: modes
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build
