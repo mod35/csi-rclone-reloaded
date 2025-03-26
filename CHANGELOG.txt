@@ -1,4 +1,7 @@
 # CHANGELOG
+1.5.1 (modes):
+- bumping to fuse3 as that's what rclone expects - bumping the alpine base images up a smidge
+
 1.5.0 (modes):
 - Forking to upgrade the underlying rclone version to fix this onedrive nightmare https://github.com/rclone/rclone/issues/7405
 
