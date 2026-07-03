@@ -1,4 +1,13 @@
 # CHANGELOG
+1.6.0 (modes):
+- Pinned rclone to v1.74.3 in all Dockerfiles (was floating "latest stable" via install.sh, which has no version pin); online builds now do a per-arch, SHA256-verified direct download.
+- Pinned the golang builder stage to golang:1.24-alpine (was untagged golang:alpine, which floated the toolchain).
+- Reconciled cmd/csi-rclone-plugin/Dockerfile(.dm) with the root Dockerfiles: fuse3 (was fuse) and alpine:3.19 (was alpine:3.16), rclone v1.74.3.
+- Removed dead driver defaults --cache-info-age=72h and --cache-chunk-clean-interval=15m (deprecated rclone "cache" backend, no-ops on VFS mounts).
+- Removed the hardcoded --dir-cache-time=5s default; it now falls through to rclone's native 5m default (5s hammered OneDrive and widened the mkdir race behind 409s).
+- BEHAVIOR CHANGE: CSI mountOptions (PV/StorageClass mountFlags) and readOnly are now honored (previously computed then discarded). A PVC mounted readOnly now passes --read-only to rclone, and PV/StorageClass mountOptions are emitted as rclone flags.
+- The per-volume rclone config is now written to a deterministic path (0600) and removed in NodeUnpublishVolume, fixing the indefinite accumulation of plaintext-secret temp files (previously ioutil.TempFile was never cleaned up).
+
 1.5.1 (modes):
 - bumping to fuse3 as that's what rclone expects - bumping the alpine base images up a smidge
 

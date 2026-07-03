@@ -1,8 +1,11 @@
-FROM alpine:3.16
-RUN apk add --no-cache ca-certificates bash fuse curl unzip tini
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates bash fuse3 curl unzip tini
 
-# RUN curl https://rclone.org/install.sh | bash
-
+# Offline (dm) build: rclone is installed from the pre-downloaded zips under
+# rclone-build/ via install-dm.sh, NOT from the network. The expected pinned
+# rclone version for rclone-build/ is v1.74.3 (keep in sync with the online
+# Dockerfiles). Populate rclone-build/ with rclone-current-linux-<arch>.zip
+# from https://downloads.rclone.org/v1.74.3/ before building.
 # Use pre-compiled version (with cirectory marker patch)
 # https://github.com/rclone/rclone/pull/5323
 COPY ./install-dm.sh /tmp

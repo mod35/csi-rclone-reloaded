@@ -1,10 +1,13 @@
 package rclone
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -30,6 +33,22 @@ type nodeServer struct {
 type mountPoint struct {
 	VolumeId  string
 	MountPath string
+}
+
+// configBaseDir is the plugin-owned directory where per-volume rclone config
+// files are written. It lives inside the plugin container (ephemeral), so the
+// plaintext secrets it may contain never accumulate on the node's host disk.
+const configBaseDir = "/var/lib/csi-rclone/configs"
+
+// configPathForTarget returns a deterministic per-volume rclone config path
+// derived from the target path. Because it is deterministic, NodeUnpublishVolume
+// can recompute the exact same path and remove the file on teardown.
+func configPathForTarget(targetPath string) string {
+	// Clean the path (e.g. strip a trailing slash) so NodePublishVolume and
+	// NodeUnpublishVolume hash to the same value even if a caller is inconsistent,
+	// guaranteeing the config file is found and removed on teardown.
+	sum := sha256.Sum256([]byte(filepath.Clean(targetPath)))
+	return filepath.Join(configBaseDir, hex.EncodeToString(sum[:])+".conf")
 }
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -69,10 +88,11 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		}
 	}
 
+	// CSI mount flags (from PV/StorageClass mountOptions) and the readOnly
+	// request are threaded through to the rclone command below. Previously
+	// these were computed and then discarded (dead code).
 	mountOptions := req.GetVolumeCapability().GetMount().GetMountFlags()
-	if req.GetReadonly() {
-		mountOptions = append(mountOptions, "ro")
-	}
+	readOnly := req.GetReadonly()
 
 	remote, remotePath, configData, flags, e := extractFlags(req.GetVolumeContext())
 	if e != nil {
@@ -80,7 +100,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, e
 	}
 
-	e = Mount(remote, remotePath, targetPath, configData, flags)
+	e = Mount(remote, remotePath, targetPath, configData, flags, mountOptions, readOnly)
 	if e != nil {
 		if os.IsPermission(e) {
 			return nil, status.Error(codes.PermissionDenied, e.Error())
@@ -189,6 +209,17 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		klog.Infof("Volume %s unmounted successfully", req.VolumeId)
 	}
 
+	// Remove the per-volume rclone config file written during NodePublishVolume.
+	// Cleanup happens here (rather than via a defer in Mount) because
+	// `rclone mount --daemon` self-forks; deleting the config immediately after
+	// mount would race the forked child re-reading it. By the time we unpublish,
+	// the mount is being torn down, so removing the config is safe. This stops
+	// the previous indefinite accumulation of plaintext-secret temp files.
+	configFile := configPathForTarget(targetPath)
+	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("failed to remove rclone config file %s: %v", configFile, err)
+	}
+
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -225,7 +256,7 @@ func getSecret(secretName string) (*v1.Secret, error) {
 
 	namespace, _, err := kubeconfig.Namespace()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "can't get current namespace, error %s", secretName, err)
+		return nil, status.Errorf(codes.Internal, "can't get current namespace for secret %s: %v", secretName, err)
 	}
 
 	klog.Infof("Loading csi-rclone connection defaults from secret %s/%s", namespace, secretName)
@@ -242,14 +273,17 @@ func getSecret(secretName string) (*v1.Secret, error) {
 }
 
 // Mount routine.
-func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string) error {
+func Mount(remote string, remotePath string, targetPath string, configData string, flags map[string]string, mountOptions []string, readOnly bool) error {
 	mountCmd := "rclone"
 	mountArgs := []string{}
 
+	// Defaults applied only when the user has not overridden them (see below).
+	// Note: cache-info-age / cache-chunk-clean-interval belonged to rclone's
+	// deprecated "cache" backend and are no-ops on a VFS mount, and a 5s
+	// dir-cache-time hammered OneDrive and widened the mkdir race behind 409s;
+	// all three were removed so dir-cache-time falls through to rclone's sane
+	// 5m native default.
 	defaultFlags := map[string]string{}
-	defaultFlags["cache-info-age"] = "72h"
-	defaultFlags["cache-chunk-clean-interval"] = "15m"
-	defaultFlags["dir-cache-time"] = "5s"
 	defaultFlags["vfs-cache-mode"] = "writes"
 	defaultFlags["allow-non-empty"] = "true"
 	defaultFlags["allow-other"] = "true"
@@ -270,29 +304,27 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		"--daemon",
 	)
 
-	// If a custom flag configData is defined,
-	// create a temporary file, fill it with  configData content,
-	// and run rclone with --config <tmpfile> flag
+	// If a custom configData is defined, write it to a deterministic per-volume
+	// config file and run rclone with --config <file>.
+	//
+	// We intentionally do NOT defer os.Remove here: `rclone mount --daemon`
+	// self-forks, so removing the file immediately would race the forked child
+	// re-reading it. Instead the file lives for the whole mount lifetime and is
+	// removed in NodeUnpublishVolume. The path is deterministic (hash of the
+	// target path) so unpublish can find and delete exactly this file, which
+	// fixes the previous indefinite leak of plaintext-secret temp files.
 	if configData != "" {
 
-		configFile, err := ioutil.TempFile("", "rclone.conf")
-		if err != nil {
+		if err := os.MkdirAll(configBaseDir, 0700); err != nil {
 			return err
 		}
 
-		// Normally, a defer os.Remove(configFile.Name()) should be placed here.
-		// However, due to a rclone mount --daemon flag, rclone forks and creates a race condition
-		// with this nodeplugin proceess. As a result, the config file gets deleted
-		// before it's reread by a forked process.
-
-		if _, err := configFile.Write([]byte(configData)); err != nil {
-			return err
-		}
-		if err := configFile.Close(); err != nil {
+		configFile := configPathForTarget(targetPath)
+		if err := ioutil.WriteFile(configFile, []byte(configData), 0600); err != nil {
 			return err
 		}
 
-		mountArgs = append(mountArgs, "--config", configFile.Name())
+		mountArgs = append(mountArgs, "--config", configFile)
 	}
 
 	// Add default flags
@@ -306,6 +338,24 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 	// Add user supplied flags
 	for k, v := range flags {
 		mountArgs = append(mountArgs, fmt.Sprintf("--%s=%s", k, v))
+	}
+
+	// Honor the CSI readOnly request.
+	if readOnly {
+		mountArgs = append(mountArgs, "--read-only")
+	}
+
+	// Honor CSI mountOptions (PV/StorageClass mountFlags) as rclone flags,
+	// prefixing "--" when the caller supplied a bare flag name.
+	for _, opt := range mountOptions {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		if !strings.HasPrefix(opt, "-") {
+			opt = "--" + opt
+		}
+		mountArgs = append(mountArgs, opt)
 	}
 
 	// create target, os.Mkdirall is noop if it exists
