@@ -1,0 +1,33 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: rclone}
+provisioner: csi-rclone
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: rclone-test-pv}
+spec:
+  accessModes: [ReadWriteMany]
+  capacity: {storage: 10Gi}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: rclone
+  claimRef: {name: rclone-test-pvc, namespace: default}
+  csi:
+    driver: csi-rclone
+    volumeHandle: rclone-test-volume-id
+    volumeAttributes:
+      remote: "local"
+      remotePath: "/srv/testdata"
+      vfs-cache-mode: "writes"
+      cache-dir: "/plugin/cache"
+      allow-non-empty: "true"
+      allow-other: "true"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: rclone-test-pvc, namespace: default}
+spec:
+  accessModes: [ReadWriteMany]
+  resources: {requests: {storage: 10Gi}}
+  storageClassName: rclone
+  volumeName: rclone-test-pv

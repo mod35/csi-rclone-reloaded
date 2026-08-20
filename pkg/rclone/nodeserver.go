@@ -1,10 +1,10 @@
 package rclone
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,22 +12,43 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/pkg/util/mount"
-	"k8s.io/kubernetes/pkg/volume/util"
 
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
+	// k8s.io/mount-utils is the maintained home of what used to be
+	// k8s.io/kubernetes/pkg/util/mount. Importing k8s.io/kubernetes as a
+	// library is unsupported upstream and was pinning this module to the 2019
+	// dependency tree.
+	mount "k8s.io/mount-utils"
+	utilexec "k8s.io/utils/exec"
 )
 
+// NOTE: never log a whole CSI request (e.g. klog.Infof("%+v", *req)). The
+// request's VolumeContext carries `configData` - the rclone config, including
+// OneDrive OAuth access/refresh tokens and crypt passwords - so a full dump
+// writes live credentials into the node-plugin pod log. It also copies a
+// sync.Mutex now that the CSI protos embed protoimpl.MessageState, which go vet
+// flags. Log individual, non-secret fields instead.
 type nodeServer struct {
-	*csicommon.DefaultNodeServer
+	// Embedding the generated Unimplemented server is what makes this
+	// forward-compatible: RPCs added to the CSI spec later return
+	// Unimplemented instead of breaking the build. It replaces the embedded
+	// csicommon.DefaultNodeServer.
+	csi.UnimplementedNodeServer
+
+	nodeID  string
 	mounter *mount.SafeFormatAndMount
+}
+
+// NodeGetInfo reports this node's ID to the kubelet. Previously supplied by
+// csicommon.DefaultNodeServer; the kubelet requires it, so it must be
+// implemented explicitly now.
+func (ns *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	return &csi.NodeGetInfoResponse{NodeId: ns.nodeID}, nil
 }
 
 type mountPoint struct {
@@ -52,7 +73,8 @@ func configPathForTarget(targetPath string) string {
 }
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	klog.Infof("NodePublishVolume: called with args %+v", *req)
+	klog.Infof("NodePublishVolume: volumeId=%s targetPath=%s stagingTargetPath=%s readOnly=%t",
+		req.GetVolumeId(), req.GetTargetPath(), req.GetStagingTargetPath(), req.GetReadonly())
 
 	targetPath := req.GetTargetPath()
 
@@ -70,7 +92,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	if !notMnt {
 		// testing original mount point, make sure the mount link is valid
-		if _, err := ioutil.ReadDir(targetPath); err == nil {
+		if _, err := os.ReadDir(targetPath); err == nil {
 			klog.Infof("already mounted to target %s", targetPath)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
@@ -79,7 +101,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 		ns.mounter = &mount.SafeFormatAndMount{
 			Interface: mount.New(""),
-			Exec:      mount.NewOsExec(),
+			Exec:      utilexec.New(),
 		}
 
 		if err := ns.mounter.Unmount(targetPath); err != nil {
@@ -87,6 +109,60 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			return nil, err
 		}
 	}
+
+	// STAGED PATH (normal since v1.7.0). NodeStageVolume has already created
+	// exactly ONE rclone mount for this volume on this node; all we do per pod
+	// is bind-mount it. This is what keeps the node to a single rclone process
+	// (and therefore a single VFS cache) per volume, no matter how many pods
+	// consume it.
+	//
+	// Why that matters: previously every pod got its own `rclone mount`, and
+	// they all shared --cache-dir. Each process independently found the same
+	// "Dirty" cache items and raced to upload them, so OneDrive returned
+	// 409 resourceModified (eTag mismatch) and files were repeatedly truncated
+	// to 0 bytes on the remote. Four pods on one node produced ~6500 409s and
+	// upload retries reached try #50.
+	if stagingTargetPath := req.GetStagingTargetPath(); stagingTargetPath != "" {
+		// Repair a dead staging mount before binding to it.
+		//
+		// This is NOT redundant with the same check in NodeStageVolume. When the
+		// node plugin restarts (a DaemonSet roll, or the postStart umount hook)
+		// the rclone process dies and the staging path becomes a dead FUSE
+		// endpoint. The kubelet still has the volume recorded as staged, so for
+		// every new pod it calls NodePublishVolume ONLY - NodeStageVolume is
+		// never called again. Without this, the bind fails with
+		// "transport endpoint is not connected" on every retry and pods sit in
+		// ContainerCreating forever. Verified in test/kind by rolling the
+		// DaemonSet while pods were running.
+		if err := ensureStaged(stagingTargetPath, req.GetVolumeContext(),
+			req.GetVolumeCapability().GetMount().GetMountFlags()); err != nil {
+			return nil, err
+		}
+
+		// Per-pod readOnly is applied HERE, on the bind mount, not on the
+		// shared rclone mount underneath - the staged mount is shared by every
+		// pod on this node, so it must stay writable for the pods that write.
+		// The k8s mounter turns []string{"bind","ro"} into the required two
+		// syscalls (bind, then remount,bind,ro); a single bind with "ro" would
+		// silently stay read-write.
+		options := []string{"bind"}
+		if req.GetReadonly() {
+			options = append(options, "ro")
+		}
+
+		klog.Infof("bind mounting staged volume %s -> %s (options=%v)", stagingTargetPath, targetPath, options)
+		if err := mount.New("").Mount(stagingTargetPath, targetPath, "", options); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to bind mount %s to %s: %v", stagingTargetPath, targetPath, err)
+		}
+
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
+	// LEGACY PATH: no staging target supplied, so mount rclone directly at the
+	// pod's target path. Retained so the driver still works if it is ever run
+	// without STAGE_UNSTAGE_VOLUME being honored by the kubelet.
+	klog.Warningf("NodePublishVolume called without a staging target path for volume %s; "+
+		"falling back to a direct per-pod rclone mount (one rclone process per pod)", req.GetVolumeId())
 
 	// CSI mount flags (from PV/StorageClass mountOptions) and the readOnly
 	// request are threaded through to the rclone command below. Previously
@@ -112,6 +188,87 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// ensureStaged guarantees stagingTargetPath is a live rclone mount, mounting or
+// re-mounting it as needed. It is idempotent and safe to call on every publish.
+//
+// Called from both NodeStageVolume and NodePublishVolume on purpose: the kubelet
+// records a volume as staged and will not re-stage it after the node plugin
+// restarts, so publish is the only hook left that can repair a staging mount
+// whose rclone process has died.
+func ensureStaged(stagingTargetPath string, volumeContext map[string]string, mountOptions []string) error {
+	// ORDER MATTERS: probe and clear a dead mount BEFORE any mkdir.
+	// os.MkdirAll stats the path first, and on a dead FUSE endpoint that stat
+	// returns ENOTCONN rather than "not a directory", so MkdirAll falls through
+	// to mkdir(2) and fails with EEXIST ("file exists"). Doing the mkdir first
+	// therefore makes a dead staging mount unrecoverable.
+	mounted, healthy, err := mountState(stagingTargetPath)
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	if mounted && healthy {
+		return nil
+	}
+	if mounted && !healthy {
+		klog.Warningf("staging path %s is a dead mount, unmounting before re-staging", stagingTargetPath)
+		if err := mount.New("").Unmount(stagingTargetPath); err != nil {
+			return status.Errorf(codes.Internal, "failed to clear dead staging mount %s: %v", stagingTargetPath, err)
+		}
+	}
+
+	// Safe now: the path is either absent or a plain directory.
+	if err := os.MkdirAll(stagingTargetPath, 0750); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	remote, remotePath, configData, flags, e := extractFlags(volumeContext)
+	if e != nil {
+		klog.Warningf("storage parameter error: %s", e)
+		return e
+	}
+
+	// readOnly is deliberately false: the staged mount is shared by every pod on
+	// this node and must stay writable for the pods that write. Per-pod readOnly
+	// is applied to the bind mount in NodePublishVolume.
+	if e := Mount(remote, remotePath, stagingTargetPath, configData, flags, mountOptions, false); e != nil {
+		if os.IsPermission(e) {
+			return status.Error(codes.PermissionDenied, e.Error())
+		}
+		if strings.Contains(e.Error(), "invalid argument") {
+			return status.Error(codes.InvalidArgument, e.Error())
+		}
+		return status.Error(codes.Internal, e.Error())
+	}
+
+	klog.Infof("staged rclone mount at %s", stagingTargetPath)
+	return nil
+}
+
+// mountState reports whether path is currently a mount point, and whether that
+// mount is actually usable. A dead FUSE mount (the rclone process behind it was
+// killed) still looks like a mount point but every syscall on it fails with
+// ENOTCONN, so "is it mounted" alone is not enough to decide anything.
+func mountState(path string) (mounted bool, healthy bool, err error) {
+	notMnt, err := mount.New("").IsLikelyNotMountPoint(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, false, nil
+		}
+		if mount.IsCorruptedMnt(err) {
+			// Mounted, but the endpoint is dead.
+			return true, false, nil
+		}
+		return false, false, err
+	}
+	if notMnt {
+		return false, false, nil
+	}
+	if _, err := os.ReadDir(path); err != nil {
+		klog.Warningf("mount point %s exists but is not readable (%v) - treating as dead", path, err)
+		return true, false, nil
+	}
+	return true, true, nil
 }
 
 // extractFlags extracts the flags from the given volumeContext
@@ -180,7 +337,7 @@ func extractFlags(volumeContext map[string]string) (string, string, string, map[
 
 func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 
-	klog.Infof("NodeUnPublishVolume: called with args %+v", *req)
+	klog.Infof("NodeUnpublishVolume: volumeId=%s targetPath=%s", req.GetVolumeId(), req.GetTargetPath())
 
 	targetPath := req.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -198,7 +355,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		klog.Infof("Volume not mounted")
 
 	} else {
-		err = util.UnmountPath(req.GetTargetPath(), m)
+		err = mount.CleanupMountPoint(req.GetTargetPath(), m, true)
 		if err != nil {
 			klog.Infof("Error while unmounting path: %s", err)
 			// This will exit and fail the NodeUnpublishVolume making it to retry unmount on the next api schedule trigger.
@@ -209,12 +366,18 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 		klog.Infof("Volume %s unmounted successfully", req.VolumeId)
 	}
 
-	// Remove the per-volume rclone config file written during NodePublishVolume.
-	// Cleanup happens here (rather than via a defer in Mount) because
+	// Remove the per-volume rclone config file, but ONLY for a legacy
+	// (unstaged) publish, where the config is keyed on this pod's target path.
+	//
+	// In the staged path the config belongs to the shared mount and is keyed on
+	// the STAGING path, so it must survive until NodeUnstageVolume - other pods
+	// are still using that mount. This call is then a harmless no-op, because
+	// no file exists at hash(targetPath).
+	//
+	// Cleanup happens on teardown (rather than via a defer in Mount) because
 	// `rclone mount --daemon` self-forks; deleting the config immediately after
-	// mount would race the forked child re-reading it. By the time we unpublish,
-	// the mount is being torn down, so removing the config is safe. This stops
-	// the previous indefinite accumulation of plaintext-secret temp files.
+	// mount would race the forked child re-reading it. This stops the previous
+	// indefinite accumulation of plaintext-secret temp files.
 	configFile := configPathForTarget(targetPath)
 	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
 		klog.Warningf("failed to remove rclone config file %s: %v", configFile, err)
@@ -223,14 +386,93 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	klog.Infof("NodeUnstageVolume: called with args %+v", *req)
-	return &csi.NodeUnstageVolumeResponse{}, nil
+// NodeGetCapabilities advertises STAGE_UNSTAGE_VOLUME.
+//
+// This override is REQUIRED and is not cosmetic: csicommon's DefaultNodeServer
+// (drivers v1.0.2) reports only RPC_UNKNOWN, and that library has no
+// AddNodeServiceCapabilities helper. Without this method shadowing the embedded
+// default, the kubelet never calls NodeStageVolume at all and the driver
+// silently falls back to one rclone mount per pod.
+func (ns *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	return &csi.NodeGetCapabilitiesResponse{
+		Capabilities: []*csi.NodeServiceCapability{
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+					},
+				},
+			},
+		},
+	}, nil
 }
 
+// NodeStageVolume creates the single rclone mount for this volume on this node.
+// Every pod that consumes the volume then gets a cheap bind mount of it in
+// NodePublishVolume, so there is exactly one rclone process - and therefore one
+// VFS cache and one uploader - per (volume, node).
 func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	klog.Infof("NodeStageVolume: called with args %+v", *req)
+	klog.Infof("NodeStageVolume: volumeId=%s stagingTargetPath=%s", req.GetVolumeId(), req.GetStagingTargetPath())
+
+	stagingTargetPath := req.GetStagingTargetPath()
+	if len(stagingTargetPath) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "NodeStageVolume Staging Target Path must be provided")
+	}
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "NodeStageVolume Volume ID must be provided")
+	}
+
+	// All of the mount/repair logic lives in ensureStaged, which NodePublishVolume
+	// also calls - the kubelet will not re-stage after a plugin restart, so publish
+	// has to be able to repair a dead staging mount too.
+	//
+	// Idempotent by construction: the kubelet re-issues NodeStageVolume on retry,
+	// and every pod after the first arrives while the volume is already staged.
+	if err := ensureStaged(stagingTargetPath, req.GetVolumeContext(),
+		req.GetVolumeCapability().GetMount().GetMountFlags()); err != nil {
+		return nil, err
+	}
+
+	klog.Infof("NodeStageVolume: staged volume %s at %s", req.GetVolumeId(), stagingTargetPath)
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// NodeUnstageVolume tears down the shared rclone mount once the last pod on
+// this node has been unpublished, and removes the per-volume rclone config.
+func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	klog.Infof("NodeUnstageVolume: volumeId=%s stagingTargetPath=%s", req.GetVolumeId(), req.GetStagingTargetPath())
+
+	stagingTargetPath := req.GetStagingTargetPath()
+	if len(stagingTargetPath) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume Staging Target Path must be provided")
+	}
+
+	m := mount.New("")
+	notMnt, err := m.IsLikelyNotMountPoint(stagingTargetPath)
+	if err != nil && !mount.IsCorruptedMnt(err) && !os.IsNotExist(err) {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if err == nil && notMnt {
+		klog.Infof("NodeUnstageVolume: %s is not mounted", stagingTargetPath)
+	} else if !os.IsNotExist(err) {
+		// UnmountPath tolerates a corrupted (ENOTCONN) mount, which is exactly
+		// the state a killed rclone process leaves behind.
+		if err := mount.CleanupMountPoint(stagingTargetPath, m, true); err != nil {
+			klog.Errorf("error unmounting staging path %s: %s", stagingTargetPath, err)
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		klog.Infof("NodeUnstageVolume: unmounted %s", stagingTargetPath)
+	}
+
+	// The staged mount owns the config file (see Mount): it is keyed on the
+	// staging path, so it is removed here rather than in NodeUnpublishVolume.
+	configFile := configPathForTarget(stagingTargetPath)
+	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("failed to remove rclone config file %s: %v", configFile, err)
+	}
+
+	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 func validateFlags(flags map[string]string) error {
@@ -263,7 +505,7 @@ func getSecret(secretName string) (*v1.Secret, error) {
 
 	secret, e := clientset.CoreV1().
 		Secrets(namespace).
-		Get(secretName, metav1.GetOptions{})
+		Get(context.TODO(), secretName, metav1.GetOptions{})
 
 	if e != nil {
 		return nil, status.Errorf(codes.Internal, "can't load csi-rclone settings from secret %s: %s", secretName, e)
@@ -320,7 +562,7 @@ func Mount(remote string, remotePath string, targetPath string, configData strin
 		}
 
 		configFile := configPathForTarget(targetPath)
-		if err := ioutil.WriteFile(configFile, []byte(configData), 0600); err != nil {
+		if err := os.WriteFile(configFile, []byte(configData), 0600); err != nil {
 			return err
 		}
 
