@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 	"github.com/spf13/cobra"
 	"github.com/wunderio/csi-rclone/pkg/rclone"
+	"os"
 )
 
 var (

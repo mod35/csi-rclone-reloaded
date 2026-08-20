@@ -1,0 +1,8 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: csi-rclone-test
+nodes:
+  - role: control-plane
+  # A second worker so we can prove the "one rclone process PER NODE" property,
+  # not just "one process total".
+  - role: worker

@@ -1,0 +1,77 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi-rclone
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: csi-nodeplugin-rclone, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: csi-nodeplugin-rclone}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: csi-nodeplugin-rclone}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: csi-nodeplugin-rclone}
+subjects:
+  - {kind: ServiceAccount, name: csi-nodeplugin-rclone, namespace: kube-system}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: csi-nodeplugin-rclone, namespace: kube-system}
+spec:
+  selector: {matchLabels: {app: csi-nodeplugin-rclone}}
+  template:
+    metadata: {labels: {app: csi-nodeplugin-rclone}}
+    spec:
+      serviceAccountName: csi-nodeplugin-rclone
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.2
+          args:
+            - --v=5
+            - --csi-address=/plugin/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-rclone/csi.sock
+          volumeMounts:
+            - {mountPath: /plugin, name: plugin-dir}
+            - {mountPath: /registration, name: registration-dir}
+        - name: rclone
+          image: csi-rclone-reloaded:v1.7.0-local
+          imagePullPolicy: Never
+          args: ["/bin/csi-rclone-plugin", "--nodeid=$(NODE_ID)", "--endpoint=$(CSI_ENDPOINT)"]
+          env:
+            - {name: NODE_ID, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: CSI_ENDPOINT, value: "unix://plugin/csi.sock"}
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities: {add: ["SYS_ADMIN"]}
+          volumeMounts:
+            - {mountPath: /plugin, name: plugin-dir}
+            - {mountPath: /var/lib/kubelet/pods, name: pods-mount-dir, mountPropagation: Bidirectional}
+            # The mount added for NodeStageVolume support - this test exercises it.
+            - {mountPath: /var/lib/kubelet/plugins/kubernetes.io/csi, name: kubernetes-csi-dir, mountPropagation: Bidirectional}
+            - {mountPath: /srv/testdata, name: testdata}
+      volumes:
+        - {name: plugin-dir, hostPath: {path: /var/lib/kubelet/plugins/csi-rclone, type: DirectoryOrCreate}}
+        - {name: pods-mount-dir, hostPath: {path: /var/lib/kubelet/pods, type: Directory}}
+        - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry, type: DirectoryOrCreate}}
+        - {name: kubernetes-csi-dir, hostPath: {path: /var/lib/kubelet/plugins/kubernetes.io/csi, type: DirectoryOrCreate}}
+        # Backing store for the local rclone remote - stands in for OneDrive.
+        - {name: testdata, hostPath: {path: /srv/testdata, type: DirectoryOrCreate}}
